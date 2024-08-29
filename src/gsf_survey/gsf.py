@@ -26,6 +26,9 @@ import pprint
 import time
 import datetime
 import math
+import statistics
+from dataclasses import dataclass, field
+from typing import List, Dict
 # import random
 from datetime import datetime
 from datetime import timedelta
@@ -36,10 +39,11 @@ from datetime import timedelta
 
 # geo = geodetic.geodesy("32750")
 
-import timeutils
+import numpy as np  # This was used for testing originally but now it used for not much else....
+import matplotlib.pyplot as plt
 
-# for testing only...
-import numpy as np
+# import gsf_survey.timeutils
+import timeutils
 
 #/* The high order 4 bits are used to define the field size for this array */
 GSF_FIELD_SIZE_DEFAULT  = 0x00  #/* Default values for field size are used used for all beam arrays */
@@ -1222,11 +1226,15 @@ class CSOUND_VELOCITY_PROFILE:
 		self.latitude 						= s[5] / 10000000
 		self.numpoints 						= s[6]
 		
-		rec_fmt = '>%dh' % (self.numpoints*2)
+		rec_fmt = '>%dl' % (self.numpoints*2)  # rec_fmt = '>%dh' % (self.numpoints*2)
 		rec_len = struct.calcsize(rec_fmt)
 		rec_unpack = struct.Struct(rec_fmt).unpack
 		data = self.fileptr.read(rec_len)
-		s = rec_unpack(data)
+		s = rec_unpack(data)  # contains depths and velocities
+
+		# Seperate depths and velocites and convert to SI units
+		self.depths = [d / 100 for d in s[::2]]  # Convert, cm -> m
+		self.velocities = [v / 100 for v in s[1::2]]  # convert cm/s -> m/s
 				
 		self.fileptr.seek(self.offset + self.numbytes + self.hdrlen, 0)	# move the file pointer to the end of the record			  
 
@@ -1367,6 +1375,32 @@ class CSWATH_BATHY_SUMMARY:
 		return pprint.pformat(vars(self))
 
 ###############################################################################
+"""
+Data classes for MBES data
+"""
+@dataclass
+class SwathPose:
+	longitude: float
+	latitude: float
+	heading: float
+	pitch: float
+	roll: float
+
+@dataclass
+class SwathInfo:
+	poses: List[SwathPose] = field(default_factory=list)
+	across_positions: List[np.ndarray] = field(default_factory=list)
+	depths: List[np.ndarray] = field(default_factory=list)
+	beam_angles: List[np.ndarray] = field(default_factory=list)
+	travel_times: List[np.ndarray] = field(default_factory=list)
+
+	factors: Dict[int, SCALEFACTOR] = field(default_factory=dict)
+
+	tide_corrections: List[np.ndarray] = field(default_factory=list)
+	depth_corrections: List[np.ndarray] = field(default_factory=list)
+
+
+###############################################################################
 class GSFREADER:
 	def __init__(self, filename, loadscalefactors=False):
 		'''
@@ -1405,13 +1439,13 @@ class GSFREADER:
 		close the file
 		'''
 		self.fileptr.close()
-		
+
 	###########################################################################
 	def rewind(self):
 		'''
 		go back to start of file
 		'''
-		self.fileptr.seek(0, 0)				
+		self.fileptr.seek(0, 0)
 
 	###########################################################################
 	def __str__(self):
@@ -1445,7 +1479,7 @@ class GSFREADER:
 	# 			return sf
 	# 	self.fileptr.seek(curr, 0)
 	# 	return None
-	
+
 	###########################################################################
 	def loadattitude(self):
 		'''
@@ -1462,7 +1496,7 @@ class GSFREADER:
 
 		while self.moreData():
 			numberofbytes, recordidentifier, datagram = self.readdatagram()
-			if recordidentifier == 	ATTITUDE:
+			if recordidentifier == ATTITUDE:
 				datagram.read()
 				ts			= np.append(ts, datagram.ts)
 				roll		= np.append(roll, datagram.roll)
@@ -1482,7 +1516,7 @@ class GSFREADER:
 
 		while self.moreData():
 			numberofbytes, recordidentifier, datagram = self.readdatagram()
-			
+
 			if recordidentifier == SWATH_BATHYMETRY:
 				datagram.read({}, True)
 				break
@@ -1502,7 +1536,7 @@ class GSFREADER:
 
 		while self.moreData():
 			numberofbytes, recordidentifier, datagram = self.readdatagram()
-			
+
 			if recordidentifier == SWATH_BATHYMETRY:
 				datagram.read({}, True)
 
@@ -1518,11 +1552,12 @@ class GSFREADER:
 				navigation.append([datagram.timestamp, datagram.longitude, datagram.latitude, datagram.depthcorrector, datagram.roll, datagram.pitch, datagram.heading, deltatime])
 				previoustimestamp = datagram.timestamp
 		self.fileptr.seek(curr, 0)
-		# print ("Navigation records loaded:", len(navigation))
 		self.rewind()
 
+		print ("Navigation records loaded:", len(navigation))
+
 		return navigation
-	###########################################################################
+
 	def getrecordcount(self):
 		'''
 		rewind, count the number of ping records as fast as possible.  useful for progress bars
@@ -1538,7 +1573,301 @@ class GSFREADER:
 
 		self.fileptr.seek(curr, 0)
 		return numpings
-		
+
+
+	def loadSVPData(self, filter=True):
+		"""
+			returns svp data as a numpy arrays: svp info, svp depth, svp velocities
+
+			Notices some SVP have values for very deep depths.
+			Using a very simple filter now.
+        """
+
+		# Filtering parameter
+		max_depth_multiplier = 4  # Used to filter SVPs w.r.t to max depth
+
+		# Initialize lists for data
+		svps_info = []
+		svps_depths = []
+		svps_velocities = []
+
+		# Start reading file
+		numSVPs = 0
+		curr = self.fileptr.tell()
+		self.rewind()
+
+		while self.moreData():
+			numberofbytes, recordidentifier, datagram = self.readdatagram()
+
+			if recordidentifier == SOUND_VELOCITY_PROFILE:
+				numSVPs += 1
+				datagram.read()
+
+				# Record relevant information
+				svps_info.append([datagram.timeofobservation, datagram.timeofobservationnanoseconds,
+								  datagram.timeofapplication, datagram.timeofapplicationnanoseconds,
+								  datagram.longitude, datagram.latitude, datagram.numpoints])
+
+				svps_depths.append(datagram.depths)
+
+				svps_velocities.append(datagram.velocities)
+
+
+			# Clean up
+		self.fileptr.seek(curr, 0)
+		self.rewind()
+
+		print(f"Number of SVPs: {numSVPs}")
+
+		if filter:
+			"""
+			This is simple filter that removes SVPs if the max depth exceeds a threshold set
+			by the median of the max depths
+			"""
+
+			# Filter out SVPs by max depth
+			max_depths = [max(svp) for svp in svps_depths]  # list of max depth for each SVP
+			med_max_depth = statistics.median(max_depths)
+			max_max_depth = med_max_depth * max_depth_multiplier  # determine max allowed depth, based on median
+			valid_inds = [index for index, max_depth in enumerate(max_depths) if max_depth < max_max_depth]
+
+			svps_info = [svps_info[index] for index in valid_inds]
+			svps_depths = [svps_depths[index] for index in valid_inds]
+			svps_velocities = [svps_velocities[index] for index in valid_inds]
+
+		return svps_info, svps_depths, svps_velocities
+
+	def loadProcessingParameters(self):
+		"""
+		Load processing parameters from the GSF. This contains info on how How the ping data is processed
+		:return:
+		"""
+		print("Reading processing parameters")
+
+		curr = self.fileptr.tell()
+		self.rewind()
+
+		while self.moreData():
+			numberofbytes, recordidentifier, datagram = self.readdatagram()
+
+			if recordidentifier == PROCESSING_PARAMETERS:
+				datagram.read()
+
+		# Clean up
+		self.fileptr.seek(curr, 0)
+		self.rewind()
+
+		print("Processing parameters:")
+		print(datagram)
+
+		return datagram
+
+
+	###########################################################################
+	def getBathymetryPingData(self):
+		'''
+		Returns swath bathymetry data.
+		swath_positions: [[longitude, latitude, heading, pitch, roll]]
+
+		Returns:  [swath_positions,
+				   swath_across_positions, swath_depths, swath_beam_angles, swath_travel_times,
+				   swath_factors, swath_tide_corrections, swath_depth_corrections]
+		'''
+
+		# TODO define dataclasses to make things a little clearer
+
+		print(f"Reading bathymetry ping datagrams")
+
+		numpings = 0
+		curr = self.fileptr.tell()
+		self.rewind()
+
+		swath_poses = []
+		swath_across_positions = []
+		swath_depths = []
+		swath_travel_times = []
+		swath_beam_angles = []
+		swath_tide_corrections = []
+		swath_depth_corrections = []
+
+		swath_factors = None
+
+		swath_info = SwathInfo()
+
+		while self.moreData():
+			numberofbytes, recordidentifier, datagram = self.readdatagram()
+
+			if recordidentifier == SWATH_BATHYMETRY:
+				datagram.read()
+
+				if numpings == 0:
+					swath_factors = datagram.scalefactorsd
+					swath_info.factors = datagram.scalefactorsd
+
+				# Record
+				#[longitude, latitude, heading, pitch, roll]
+				# swath_positions.append([datagram.longitude, datagram.latitude,
+				# 				  datagram.heading, datagram.pitch, datagram.roll])
+
+				swath_pose = SwathPose(longitude=datagram.longitude,
+									   latitude=datagram.latitude,
+									   heading=datagram.heading,
+									   pitch=datagram.pitch,
+									   roll=datagram.roll)
+
+				swath_poses.append(swath_pose)
+				swath_info.poses.append(swath_pose)
+
+				# Processed Soundings
+				swath_across_positions.append(datagram.ACROSS_TRACK_ARRAY)
+				swath_depths.append(datagram.DEPTH_ARRAY)
+
+				swath_info.across_positions.append(datagram.ACROSS_TRACK_ARRAY)
+				swath_info.depths.append(datagram.DEPTH_ARRAY)
+
+				# Raw soundinds
+				swath_beam_angles.append(datagram.BEAM_ANGLE_ARRAY)
+				swath_travel_times.append(datagram.TRAVEL_TIME_ARRAY)
+
+				swath_info.beam_angles.append(datagram.BEAM_ANGLE_ARRAY)
+				swath_info.travel_times.append(datagram.TRAVEL_TIME_ARRAY)
+
+				# Corrections
+				swath_tide_corrections.append(datagram.tidecorrector)
+				swath_depth_corrections.append(datagram.depthcorrector)
+
+				swath_info.tide_corrections.append(datagram.tidecorrector)
+				swath_info.depth_corrections.append(datagram.depthcorrector)
+
+				numpings += 1
+
+		# Clean up
+		self.fileptr.seek(curr, 0)
+		self.rewind()
+
+		print(f"Number of Pings: {numpings}")
+
+		# Old return
+		# swath_complete = [swath_poses,
+		# 		   		  swath_across_positions, swath_depths, swath_beam_angles, swath_travel_times,
+		# 		   		  swath_factors, swath_tide_corrections, swath_depth_corrections]
+
+		return swath_info  # swath_complete
+
+	###########################################################################
+	def checkBathymetryPingData(self, n=0):
+		'''
+		Function to check if there is agreement between processed data and the raw beam angle/travel time data
+
+		This should be restructed to be a little more generic, I need to make an analysis class...
+		Well anyways, this function shows some useful stuff for basic data processing
+		'''
+
+		print(f"Checking bathymetry ping datagrams")
+		print(f"Only performing check once per file")
+
+		if n < 0:
+			n = 0
+
+		ping_count = 0
+
+		# load first bathymetry ping datagram
+		curr = self.fileptr.tell()
+		self.rewind()
+
+		while self.moreData():
+			numberofbytes, recordidentifier, datagram = self.readdatagram()
+
+			if recordidentifier == SWATH_BATHYMETRY:
+				if ping_count == 0:
+					datagram.read()
+					# record scale factors
+					# This might only be present on the first ping?
+					scale_factors = datagram.scalefactorsd
+				elif ping_count >= n:
+					datagram.read()
+					break
+				else:
+					# Do quick read if not ping of interest
+					datagram.read({}, True)
+
+				ping_count += 1
+
+		self.fileptr.seek(curr, 0)
+		self.rewind()
+
+		# Perform check
+		across_track = datagram.ACROSS_TRACK_ARRAY[0]
+		beam_angle = datagram.BEAM_ANGLE_ARRAY[0]
+		depth = datagram.DEPTH_ARRAY[0]
+		travel_time = datagram.TRAVEL_TIME_ARRAY[0]
+		sound_speed = 1500  # m/s, This is stored in the file somewhere
+		tide_correction = datagram.tidecorrector
+
+		# We need to apply angular offset of heads
+		angle_offset = scale_factors[1].offset  # Only scale factor that has an offset
+
+		# The provided offset needs the be adjusted depending on which head the data is coming from
+		# Port data (-deg) apply negative offset
+		# Starboard data (+deg) apply positive offset
+		center_beam_angle = datagram.BEAM_ANGLE_ARRAY[len(datagram.BEAM_ANGLE_ARRAY)//2]
+		if center_beam_angle < 0:  # PORT
+			angle_offset = -1 * abs(angle_offset)  # force negative offset
+		else:
+			angle_offset = abs(angle_offset)  # force positive offset
+
+		# Apply the correct offset to the raw beam angle
+		true_beam_angle = beam_angle + angle_offset
+
+		slant_range = (travel_time * sound_speed) / 2
+		travel_time_across_track = slant_range * math.sin(math.radians(true_beam_angle))
+		travel_time_depth = slant_range * math.cos(math.radians(true_beam_angle))
+
+		travel_time_start = [0,0]
+		travel_time_end = [travel_time_across_track,-travel_time_depth]
+
+		processed_depth_start = [0,0]
+		processed_depth_end = [0, -depth]
+
+		processed_vertical_start = processed_depth_end
+		processed_vertical_end = [across_track, -depth]
+
+		processed_distance = (across_track**2 + depth**2)**(1/2)
+		processed_beam_angle = math.degrees(math.atan2(across_track, depth))
+
+		start_points = [travel_time_start, processed_depth_start, processed_vertical_start]
+		end_points = [travel_time_end, processed_depth_end, processed_vertical_end]
+		colors = ["green", "blue", "blue"]
+
+		# Initialize a plot
+		plt.figure()
+
+		# Plot each line
+		for start, end, color in zip(start_points, end_points, colors):
+			x_values = [start[0], end[0]]
+			y_values = [start[1], end[1]]
+			plt.plot(x_values, y_values, c=color, marker='o')
+
+		# Add error bars to specified points
+		plt.errorbar(travel_time_end[0], travel_time_end[1],
+					 xerr=0, yerr=abs(tide_correction), fmt='o', color='red', ecolor='red', capsize=5)
+
+		plt.scatter(datagram.ACROSS_TRACK_ARRAY,-datagram.DEPTH_ARRAY)
+
+		# Set plot title and labels
+		plt.title(f"Checking\n"
+				  f"travel time distance: {slant_range}  Processed distance: {processed_distance}\n"
+				  f"travel time angle: {true_beam_angle}  Processed beam angle: {processed_beam_angle}")
+		plt.xlabel("X-axis")
+		plt.ylabel("Y-axis")
+
+		# Force the axes to be equal
+		plt.axis('equal')
+
+		# Display the plot
+		plt.grid(True)
+		plt.show()
+
 	###########################################################################
 	def readdatagram(self):
 		# read the datagram header.  This permits us to skip datagrams we do not support
@@ -1551,7 +1880,7 @@ class GSFREADER:
 			# create a class for this datagram, but only decode if the resulting class if called by the user.  This makes it much faster
 			dg = CHEADER(self.fileptr, numberofbytes, recordidentifier, hdrlen)
 			# self.fileptr.seek(numberofbytes, 1) # set the file ptr to the end of the record			
-			return numberofbytes, recordidentifier, dg		
+			return numberofbytes, recordidentifier, dg
 
 		if recordidentifier == 	COMMENT:
 			dg = CCOMMENT(self.fileptr, numberofbytes, recordidentifier, hdrlen)
@@ -1568,21 +1897,21 @@ class GSFREADER:
 		if recordidentifier == SWATH_BATHYMETRY:
 			dg = SWATH_BATHYMETRY_PING(self.fileptr, numberofbytes, recordidentifier, hdrlen)
 			# dg.scalefactors = self.scalefactors
-			return numberofbytes, recordidentifier, dg 
+			return numberofbytes, recordidentifier, dg
 
 		elif recordidentifier == SWATH_BATHY_SUMMARY:
 			dg = CSWATH_BATHY_SUMMARY(self.fileptr, numberofbytes, recordidentifier, hdrlen)
 			# dg.scalefactors = self.scalefactors
-			return numberofbytes, recordidentifier, dg 
+			return numberofbytes, recordidentifier, dg
 
 		if recordidentifier == ATTITUDE:
 			dg = CATTITUDE(self.fileptr, numberofbytes, recordidentifier, hdrlen)
-			return numberofbytes, recordidentifier, dg 
+			return numberofbytes, recordidentifier, dg
 
 		# elif recordidentifier == 3: # SOUND_VELOCITY_PROFILE
 		# 	dg = SOUND_VELOCITY_PROFILE(self.fileptr, numberofbytes)
 		# 	return dg.recordidentifier, dg 
-		
+
 		else:
 			# dg = UNKNOWN_RECORD(self.fileptr, numberofbytes, recordidentifier, hdrlen)
 			self.fileptr.seek(numberofbytes, 1) # set the file ptr to the end of the record			
@@ -1627,11 +1956,11 @@ class GSFREADER:
 		# 	# read the checksum of 4 bytes if required
 		# 	chksum = self.fileptr.read(4)
 		# 	return (sizeofdata + self.hdrlen + 4, recordidentifier, haschecksum, self.hdrlen + 4)
-		
+
 		# now reset file pointer to the start of the record
 		self.fileptr.seek(curr, 0)
 		return (sizeofdata + self.hdrlen, recordidentifier, haschecksum, self.hdrlen )
-		
+
 		# if haschecksum == true:
 		# 	return (sizeofdata + 4, recordidentifier, haschecksum, self.hdrlen + 4)
 		# 	# return (sizeofdata + self.hdrlen + 4, recordidentifier, haschecksum, self.hdrlen + 4)
